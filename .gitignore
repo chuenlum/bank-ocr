@@ -56,3 +56,5 @@ exports/
 
 # User specific
 img/
+bank-statements/
+transactions.db

@@ -9,9 +9,13 @@ from PIL import Image, ImageOps
 from dotenv import load_dotenv
 from openai import AzureOpenAI
 import io
+import database
 
 # Load environment variables
 load_dotenv()
+
+# Initialize Database
+database.init_db()
 
 # Initialize Azure OpenAI Client
 client = AzureOpenAI(
@@ -143,23 +147,19 @@ if st.button("Process") and uploaded_files:
     if all_transactions:
         df = pd.DataFrame(all_transactions)
 
-        # Reorder columns if possible to put source_file first or last
-        cols = ['date', 'description', 'withdrawal', 'deposit', 'balance', 'source_file']
-        # Filter to only columns that exist in case AI missed some
-        cols = [c for c in cols if c in df.columns]
-        # Add any other columns that might have been returned
-        remaining_cols = [c for c in df.columns if c not in cols]
-        df = df[cols + remaining_cols]
+        # Save to Database
+        # We pass the dataframe and a generic filename if it was a batch,
+        # but actually save_transactions handles the source_file column if present.
+        # We'll pass the first filename as a fallback if needed, but our logic in database.py
+        # uses the row's source_file.
 
-        st.subheader("Extracted Data")
+        saved_count = database.save_transactions(df, uploaded_files[0].name if uploaded_files else "unknown")
+
+        st.success(f"Processed {len(df)} transactions. Saved {saved_count} new records to database (duplicates ignored).")
+        st.info("Go to the 'Classifier' page to view and categorize your data.")
+
+        st.subheader("Extracted Data (Preview)")
         st.dataframe(df)
 
-        csv = df.to_csv(index=False).encode('utf-8')
-        st.download_button(
-            label="Download CSV",
-            data=csv,
-            file_name="bank_transactions.csv",
-            mime="text/csv",
-        )
     else:
         st.warning("No transactions extracted.")
