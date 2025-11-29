@@ -23,9 +23,16 @@ def init_db():
             amount REAL,
             category TEXT DEFAULT 'Uncategorized',
             source_file TEXT,
+            project_name TEXT,
             UNIQUE(date, description, amount, source_file)
         )
     ''')
+
+    # Migration: Add project_name if it doesn't exist
+    cursor.execute("PRAGMA table_info(transactions)")
+    columns = [info[1] for info in cursor.fetchall()]
+    if 'project_name' not in columns:
+        cursor.execute("ALTER TABLE transactions ADD COLUMN project_name TEXT")
 
     # Categories table
     cursor.execute('''
@@ -41,6 +48,14 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             keyword TEXT UNIQUE,
             category_name TEXT
+        )
+    ''')
+
+    # Settings table
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
         )
     ''')
 
@@ -69,19 +84,6 @@ def save_transactions(df, filename):
     cursor = conn.cursor()
 
     saved_count = 0
-
-    # Prepare data for insertion
-    # Ensure columns exist and are in order
-    # Expected columns in df: date, description, withdrawal, deposit, balance (maybe), source_file
-    # We need to normalize this to match the DB schema: date, description, amount, category, source_file
-
-    # Note: The OCR output might have 'withdrawal' and 'deposit'.
-    # We should normalize it BEFORE saving if we want to store 'amount'.
-    # However, the user's prompt for Page 2 said "If Withdrawal/Deposit columns exist, merge them...".
-    # This implies the DB might store them raw, OR we normalize before saving.
-    # The prompt for database.py said: "Columns: id, date, description, amount, category, source_file".
-    # So we MUST normalize to 'amount' before saving.
-
     records_to_insert = []
 
     for _, row in df.iterrows():
@@ -100,13 +102,14 @@ def save_transactions(df, filename):
 
         # Category default
         category = 'Uncategorized'
+        project_name = None # Default project name
 
-        records_to_insert.append((date, desc, amount, category, source))
+        records_to_insert.append((date, desc, amount, category, source, project_name))
 
     # Use INSERT OR IGNORE to handle duplicates
     cursor.executemany('''
-        INSERT OR IGNORE INTO transactions (date, description, amount, category, source_file)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT OR IGNORE INTO transactions (date, description, amount, category, source_file, project_name)
+        VALUES (?, ?, ?, ?, ?, ?)
     ''', records_to_insert)
 
     saved_count = cursor.rowcount
@@ -134,40 +137,90 @@ def get_uncategorized():
     conn.close()
     return df
 
-def update_category(id, new_category):
+def update_transaction(id, field, value):
     """
-    Update the category for a specific transaction ID.
+    Update a specific field for a transaction.
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    query = f"UPDATE transactions SET {field} = ? WHERE id = ?"
+    cursor.execute(query, (value, id))
+    conn.commit()
+    conn.close()
+
+def update_transactions_batch(updates):
+    """
+    Update multiple transactions at once.
+    updates: list of dictionaries with 'id' and fields to update.
+    Example: [{'id': 1, 'category': 'Meals'}, {'id': 2, 'project_name': 'Project A'}]
     """
     conn = get_connection()
     cursor = conn.cursor()
 
-    cursor.execute("UPDATE transactions SET category = ? WHERE id = ?", (new_category, id))
+    for update in updates:
+        id = update.pop('id')
+        set_clause = ", ".join([f"{k} = ?" for k in update.keys()])
+        values = list(update.values())
+        values.append(id)
+
+        cursor.execute(f"UPDATE transactions SET {set_clause} WHERE id = ?", values)
 
     conn.commit()
     conn.close()
 
-def update_categories_batch(updates):
+def delete_transactions(ids):
     """
-    Update multiple categories at once.
-    updates: list of tuples (id, new_category)
+    Delete transactions by ID list.
     """
+    if not ids:
+        return
     conn = get_connection()
     cursor = conn.cursor()
+    placeholders = ', '.join(['?'] * len(ids))
+    cursor.execute(f"DELETE FROM transactions WHERE id IN ({placeholders})", ids)
+    conn.commit()
+    conn.close()
 
-    cursor.executemany("UPDATE transactions SET category = ? WHERE id = ?", [(cat, id) for id, cat in updates])
+# --- Settings Management ---
 
+def get_starting_balance():
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT value FROM settings WHERE key = 'starting_balance'")
+    row = cursor.fetchone()
+    conn.close()
+    if row:
+        return float(row[0])
+    return 0.0
+
+def set_starting_balance(amount):
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('starting_balance', ?)", (str(amount),))
     conn.commit()
     conn.close()
 
 # --- Category Management ---
 
 def get_categories():
+    """
+    Return categories as a list of names.
+    """
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT name FROM categories ORDER BY name")
     categories = [row[0] for row in cursor.fetchall()]
     conn.close()
     return categories
+
+def get_categories_df():
+    """
+    Return categories as a DataFrame with id and name.
+    """
+    conn = get_connection()
+    df = pd.read_sql_query("SELECT * FROM categories ORDER BY name", conn)
+    conn.close()
+    return df
 
 def add_category(name):
     try:
@@ -179,6 +232,38 @@ def add_category(name):
         return True
     except sqlite3.IntegrityError:
         return False
+
+def update_category_name(id, new_name):
+    """
+    Update a category name and propagate the change to transactions and rules.
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    try:
+        # Get old name
+        cursor.execute("SELECT name FROM categories WHERE id = ?", (id,))
+        row = cursor.fetchone()
+        if not row:
+            return False
+        old_name = row[0]
+
+        # Update category name
+        cursor.execute("UPDATE categories SET name = ? WHERE id = ?", (new_name, id))
+
+        # Propagate to transactions
+        cursor.execute("UPDATE transactions SET category = ? WHERE category = ?", (new_name, old_name))
+
+        # Propagate to rules
+        cursor.execute("UPDATE rules SET category_name = ? WHERE category_name = ?", (new_name, old_name))
+
+        conn.commit()
+        return True
+    except sqlite3.IntegrityError:
+        # Likely new name already exists
+        return False
+    finally:
+        conn.close()
 
 def delete_category(name):
     conn = get_connection()

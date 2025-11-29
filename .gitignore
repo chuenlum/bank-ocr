@@ -53,6 +53,7 @@ venv.bak/
 output/
 data/
 exports/
+transactions.db
 
 # User specific
 img/
